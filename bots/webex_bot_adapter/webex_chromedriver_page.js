@@ -31,6 +31,8 @@ const SLOT_MEMBER_MIN_SCORE = 0.2;
 const SLOT_MEMBER_SWITCH_MARGIN = 0.2;
 // The RMS below which the adapter treats per participant audio as silence
 const AUDIBLE_RMS = 0.01;
+// A transcript's first interim caption arrives about this long after its speech starts (measured: 0.9 to 1.5 seconds)
+const CAPTION_START_LAG_MS = 1200;
 const AUDIO_ACTIVITY_REPORT_INTERVAL_MS = 1000;
 const CAPTIONS_ANNOUNCEMENT_TIMEOUT_MS = 20000;
 const WEBEX_ERROR_CODE_MEETING_NOT_FOUND = 2403014;
@@ -164,8 +166,6 @@ function handleMembersUpdate({ delta = {} }) {
 
 const activeSpeakerIds = new Set();
 const pendingSpeechStops = new Map();
-// Who Webex says is speaking right now, without the stop delay, which is what the audio slots learn their member from
-let reportedSpeakerIds = new Set();
 
 function sendSpeechEvent(participantId, isSpeechStart, timestamp) {
     if (!wantsSpeechEvents) return;
@@ -175,7 +175,6 @@ function sendSpeechEvent(participantId, isSpeechStart, timestamp) {
 function handleActiveSpeakerChanged({ memberIds = [] }) {
     const reported = new Set(memberIds);
     const now = Date.now();
-    reportedSpeakerIds = reported;
 
     for (const id of reported) {
         clearTimeout(pendingSpeechStops.get(id));
@@ -255,11 +254,57 @@ async function forEachAudioFrame(track, onSamples) {
 // Webex sends each recent speaker in an audio slot of their own and keeps them in it while they stay among the recent
 // speakers, so people talking over each other arrive separately (measured: over 99% of a slot's speech was one
 // speaker's). It does not say which member is in which slot: the slots never report a source and the RTP packets carry
-// no contributing source. So each slot learns its member from the active speaker reports, as an average over the
-// frames where the slot is audible of whether each member was reported speaking. A new speaker in a slot takes it over
-// after about SLOT_MEMBER_TIME_CONSTANT_MS of their speech. Each frame is held back for perParticipantAudioUtteranceDelayMs,
-// so the reports that cover it have arrived, and then sent as the audio of the slot's member.
+// no contributing source. So each slot learns its member from the captions, which name the speaker of each transcript
+// by capture source id: an average over the frames where the slot is audible of whether a caption says each member was
+// speaking at that moment. A new speaker in a slot takes it over after about SLOT_MEMBER_TIME_CONSTANT_MS of their
+// speech. Each frame is held back for perParticipantAudioUtteranceDelayMs, so the captions that cover it have arrived,
+// then scored and sent as the audio of the slot's member.
 const audioSlots = [];
+
+// When the captions say each member was speaking, per transcript and member, as { memberId, start, end, isFinal }. Until
+// the final caption arrives with the exact span, a transcript is taken to have started CAPTION_START_LAG_MS before its
+// first interim caption and to last until its latest one.
+const captionSpans = new Map();
+
+function memberIdForCsi(csi) {
+    const members = Object.values(meeting.members.membersCollection.members);
+    return members.find((member) => member.participant?.status?.csis?.includes(csi))?.id;
+}
+
+// The raw captions from the SDK's transcription plugin. The meeting's caption event drops the capture source ids and
+// keeps only a "m:ss" timestamp.
+function handleRawCaption({ transcriptId, isFinal, transcripts = [] }) {
+    const now = Date.now();
+    for (const transcript of transcripts) {
+        const memberId = (transcript.csis ?? []).map(memberIdForCsi).find(Boolean);
+        if (!memberId || memberId === meeting.members.selfId) continue;
+
+        const key = `${transcriptId}_${memberId}`;
+        const span = captionSpans.get(key) ?? { memberId, start: now - CAPTION_START_LAG_MS, end: now, isFinal: false };
+        if (isFinal && transcript.last_packet_timestamp_ms) {
+            span.end = transcript.last_packet_timestamp_ms;
+            span.start = span.end - (transcript.end_millis - transcript.start_millis);
+            span.isFinal = true;
+        } else if (!span.isFinal) {
+            span.end = now;
+        }
+        captionSpans.set(key, span);
+    }
+}
+
+function captionSpeakerIdsAt(timestampMs) {
+    const ids = new Set();
+    for (const { memberId, start, end } of captionSpans.values()) {
+        if (start <= timestampMs && timestampMs <= end) ids.add(memberId);
+    }
+    return ids;
+}
+
+function forgetCaptionSpansBefore(timestampMs) {
+    for (const [key, { end }] of captionSpans) {
+        if (end < timestampMs) captionSpans.delete(key);
+    }
+}
 
 function isAudible(samples) {
     let sumOfSquares = 0;
@@ -267,14 +312,15 @@ function isAudible(samples) {
     return Math.sqrt(sumOfSquares / samples.length) >= AUDIBLE_RMS;
 }
 
-function updateSlotMemberScores(slot, samples) {
-    if (!isAudible(samples)) return;
+function updateSlotMemberScores(slot, { samples, arrivedAt, audible }) {
+    if (!audible) return;
+    const speakingIds = captionSpeakerIdsAt(arrivedAt);
     const step = samples.length / (AUDIO_SAMPLE_RATE / 1000) / SLOT_MEMBER_TIME_CONSTANT_MS;
-    for (const id of reportedSpeakerIds) {
-        if (id !== meeting.members.selfId && !slot.memberScores.has(id)) slot.memberScores.set(id, 0);
+    for (const id of speakingIds) {
+        if (!slot.memberScores.has(id)) slot.memberScores.set(id, 0);
     }
     for (const [id, score] of slot.memberScores) {
-        slot.memberScores.set(id, score + step * ((reportedSpeakerIds.has(id) ? 1 : 0) - score));
+        slot.memberScores.set(id, score + step * ((speakingIds.has(id) ? 1 : 0) - score));
     }
 }
 
@@ -303,13 +349,15 @@ function updateSlotMembers() {
 
 function handleSlotAudio(slot, samples) {
     const now = Date.now();
-    updateSlotMemberScores(slot, samples);
-    slot.queue.push({ samples, arrivedAt: now });
+    slot.queue.push({ samples, arrivedAt: now, audible: isAudible(samples) });
 
     while (slot.queue.length && now - slot.queue[0].arrivedAt >= initialData.perParticipantAudioUtteranceDelayMs) {
-        const { samples: delayedSamples } = slot.queue.shift();
+        const frame = slot.queue.shift();
+        updateSlotMemberScores(slot, frame);
         updateSlotMembers();
-        if (slot.memberId) window.ws.sendPerParticipantAudio(slot.memberId, delayedSamples);
+        if (slot.memberId) window.ws.sendPerParticipantAudio(slot.memberId, frame.samples);
+        // Captions about speech well before the frames still waiting are no longer needed
+        forgetCaptionSpansBefore(frame.arrivedAt - 30000);
     }
 }
 
@@ -433,7 +481,8 @@ function handleCaptionReceived({ captions }) {
 // runs right after joining. The first call also registers the SDK's listeners, so call it once, wait for the
 // transcription announcement (sent once the LLM connection is up), then call it again.
 async function startCaptions() {
-    meeting.on('meeting:caption-received', handleCaptionReceived);
+    if (wantsCaptions) meeting.on('meeting:caption-received', handleCaptionReceived);
+    if (wantsPerParticipantAudio) webex.internal.voicea.on('voicea:newCaption', handleRawCaption);
 
     try {
         const announced = new Promise((resolve) => meeting.once('meeting:startedReceivingTranscription', resolve));
@@ -445,7 +494,11 @@ async function startCaptions() {
         console.error('Starting captions failed', error);
     }
 
-    if (meeting.transcription?.status !== 'enabled') send({ type: 'ClosedCaptionStatusChange', change: 'save_caption_not_allowed' });
+    // Only a bot transcribed with the captions fails without them. Without captions, per participant audio has no speakers.
+    if (meeting.transcription?.status !== 'enabled') {
+        if (wantsCaptions) send({ type: 'ClosedCaptionStatusChange', change: 'save_caption_not_allowed' });
+        if (wantsPerParticipantAudio) console.error('Captions are off, so per participant audio cannot be attributed');
+    }
 }
 
 // ---------- Bot output (webcam image, audio) ----------
@@ -553,7 +606,8 @@ async function main() {
         if (!(await joinMeeting())) return;
         joinState.phase = 'joined';
         setUpBotOutput();
-        if (wantsCaptions) await startCaptions();
+        // Per participant audio learns who is in each audio slot from the captions
+        if (wantsCaptions || wantsPerParticipantAudio) await startCaptions();
     } catch (error) {
         failJoin(error, 'join');
     }
